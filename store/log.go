@@ -1,78 +1,145 @@
 package store
 
 import (
-	"crypto/rand"
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"time"
 )
 
 type Log struct {
-	currentSegment *os.File
+	activeSegment *os.File
+	totalSegments int
 }
 
 func NewLog() *Log {
-	filename := fmt.Sprintf("./db/%s", rand.Text())
 
-	newSegment, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
+	if err := ensureDir("db"); err != nil {
+		panic(err)
+	}
+	dir, err := os.ReadDir("db")
+	if err != nil {
+		panic(err)
+	}
+	var (
+		filename      string
+		totalSegments int
+	)
+	if len(dir) == 0 {
+		filename = fmt.Sprintf("./db/%d", time.Now().UnixMicro())
+	} else {
+		filename = fmt.Sprintf("./db/%s", dir[len(dir)-1].Name())
+		totalSegments = len(dir)
+	}
+	newSegment, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {
 		panic(err)
 	}
 	return &Log{
-		currentSegment: newSegment,
+		activeSegment: newSegment,
+		totalSegments: totalSegments,
 	}
 }
 
+// func createSegment()
+func ensureDir(dirName string) error {
+	err := os.Mkdir(dirName, 0755)
+	if err == nil {
+		return nil
+	}
+	if os.IsExist(err) {
+		// check that the existing path is a directory
+		info, err := os.Stat(dirName)
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			return errors.New("path exists but is not a directory")
+		}
+		return nil
+	}
+	return err
+}
 func (l *Log) write(k, v []byte) (int64, error) {
+
 	var (
 		keyLen int64 = int64(len(k))
 		valLen int64 = int64(len(v))
 	)
 
-	offset, err := l.currentSegment.Seek(0, io.SeekCurrent)
+	offset, err := l.activeSegment.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return -1, err
 	}
-	if err := binary.Write(l.currentSegment, binary.LittleEndian, keyLen); err != nil {
+	if err := binary.Write(l.activeSegment, binary.LittleEndian, keyLen); err != nil {
 		return -1, err
 	}
-	if err := binary.Write(l.currentSegment, binary.LittleEndian, k); err != nil {
+	if err := binary.Write(l.activeSegment, binary.LittleEndian, k); err != nil {
 		return -1, err
 	}
-	if err := binary.Write(l.currentSegment, binary.LittleEndian, valLen); err != nil {
+	if err := binary.Write(l.activeSegment, binary.LittleEndian, valLen); err != nil {
 		return -1, err
 	}
-	if err := binary.Write(l.currentSegment, binary.LittleEndian, v); err != nil {
+	if err := binary.Write(l.activeSegment, binary.LittleEndian, v); err != nil {
 		return -1, err
 	}
+	size := l.getFileSz()
+	if size >= 2<<16 {
+		f, err := l.createNewSegment()
+		if err != nil {
+			return -1, err
+		}
+		l.activeSegment.Close()
+		l.activeSegment = f
+	}
+
 	return offset, nil
 }
 
-func (l *Log) read(pos int64) ([]byte, error) {
-	_, err := l.currentSegment.Seek(pos, io.SeekStart)
+func (l *Log) read(fileId string, pos, valSz int64) ([]byte, error) {
+
+	var (
+		f   *os.File
+		err error
+	)
+	if fileId == l.activeSegment.Name() {
+		f = l.activeSegment
+	} else {
+		f, err = os.Open(fileId)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+	}
+
+	val := make([]byte, valSz)
+	_, err = f.ReadAt(val, pos)
 	if err != nil {
 		return nil, err
 	}
-
-	var (
-		keyLen int64
-		valLen int64
-	)
-
-	if err := binary.Read(l.currentSegment, binary.LittleEndian, &keyLen); err != nil {
-		return nil, err
-	}
-	key := make([]byte, keyLen)
-	if err := binary.Read(l.currentSegment, binary.LittleEndian, &key); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(l.currentSegment, binary.LittleEndian, &valLen); err != nil {
-		return nil, err
-	}
-	val := make([]byte, valLen)
-	if err := binary.Read(l.currentSegment, binary.LittleEndian, &val); err != nil {
+	if err := binary.Read(bytes.NewReader(val), binary.LittleEndian, &val); err != nil {
 		return nil, err
 	}
 	return val, nil
+}
+
+func (l *Log) getFileSz() int64 {
+	info, err := l.activeSegment.Stat()
+	if err != nil {
+		return -1
+	}
+	return info.Size()
+}
+
+func (l *Log) createNewSegment() (*os.File, error) {
+
+	filename := fmt.Sprintf("./db/%d", time.Now().UnixMicro())
+	newSegment, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
+	}
+	return newSegment, err
 }
