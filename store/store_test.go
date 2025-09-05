@@ -28,7 +28,7 @@ func TestSimpleLog(t *testing.T) {
 	val := []byte("World")
 	log.write(key, val)
 
-	v, err := log.read(log.activeSegment.Name(), 0, int64(len(val)))
+	v, err := log.read(log.activeSegment, 0, int64(len(val)))
 	if err != nil {
 		t.FailNow()
 	}
@@ -134,4 +134,32 @@ func TestMerge(t *testing.T) {
 
 	// }
 	// clearDB()
+}
+
+func TestStoreSaveLoad(t *testing.T) {
+	clearDB()
+	s := NewStore()
+	n := 100_000
+	for i := range n {
+		key := fmt.Appendf(nil, "key_%d", i)
+		val := fmt.Appendf(nil, "val_%d", i)
+		s.Write(key, val)
+	}
+
+	s.Stop()
+	fmt.Println("Stopped")
+	s = NewStore()
+	for i := range n {
+		key := fmt.Appendf(nil, "key_%d", i)
+		val := fmt.Appendf(nil, "val_%d", i)
+		v, err := s.Read(key)
+		if err != nil {
+			fmt.Println(err)
+			t.FailNow()
+		}
+		if !bytes.Equal(v, val) {
+			fmt.Printf("Expected %s, got %s\n", string(val), string(v))
+		}
+	}
+
 }

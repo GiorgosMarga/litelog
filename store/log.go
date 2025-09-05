@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -31,8 +32,12 @@ func NewLog() *Log {
 	if len(dir) == 0 {
 		filename = fmt.Sprintf("./db/%d", time.Now().UnixMicro())
 	} else {
-		filename = fmt.Sprintf("./db/%s", dir[len(dir)-1].Name())
-		totalSegments = len(dir)
+		for i := len(dir) - 1; i >= 0; i-- {
+			if !strings.HasPrefix(dir[i].Name(), "kd") {
+				filename = fmt.Sprintf("./db/%s", dir[i].Name())
+				break
+			}
+		}
 	}
 	newSegment, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {
@@ -41,6 +46,12 @@ func NewLog() *Log {
 	return &Log{
 		activeSegment: newSegment,
 		totalSegments: totalSegments,
+	}
+}
+
+func (l *Log) close() {
+	if l.activeSegment != nil {
+		l.activeSegment.Close()
 	}
 }
 
@@ -99,24 +110,10 @@ func (l *Log) write(k, v []byte) (int64, error) {
 	return offset, nil
 }
 
-func (l *Log) read(fileId string, pos, valSz int64) ([]byte, error) {
-
-	var (
-		f   *os.File
-		err error
-	)
-	if fileId == l.activeSegment.Name() {
-		f = l.activeSegment
-	} else {
-		f, err = os.Open(fileId)
-		if err != nil {
-			return nil, err
-		}
-		defer f.Close()
-	}
+func (l *Log) read(f *os.File, pos, valSz int64) ([]byte, error) {
 
 	val := make([]byte, valSz)
-	_, err = f.ReadAt(val, pos)
+	_, err := f.ReadAt(val, pos)
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +132,6 @@ func (l *Log) getFileSz() int64 {
 }
 
 func (l *Log) createNewSegment() (*os.File, error) {
-
 	filename := fmt.Sprintf("./db/%d", time.Now().UnixMicro())
 	newSegment, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {

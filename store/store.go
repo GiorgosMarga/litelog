@@ -6,21 +6,31 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
 
 type Store struct {
-	log    *Log
-	keyDir *KeyDir
-	mtx    *sync.RWMutex
+	log        *Log
+	keyDir     *KeyDir
+	mtx        *sync.RWMutex
+	lru        *lru
+	cancelChan chan struct{}
 }
 
 func NewStore() *Store {
+
+	kd := NewKeyDir()
+	if err := kd.load(); err != nil {
+		log.Fatal(err)
+	}
 	store := &Store{
-		log:    NewLog(),
-		keyDir: NewKeyDir(),
-		mtx:    &sync.RWMutex{},
+		log:        NewLog(),
+		keyDir:     kd,
+		mtx:        &sync.RWMutex{},
+		cancelChan: make(chan struct{}),
+		lru:        NewLRU(20),
 	}
 
 	go func(s *Store) {
@@ -30,6 +40,9 @@ func NewStore() *Store {
 			select {
 			case <-timer.C:
 				store.merge()
+			case <-s.cancelChan:
+				fmt.Println("Stop merging")
+				return
 			default:
 				time.Sleep(10 * time.Millisecond)
 			}
@@ -61,10 +74,44 @@ func (s *Store) Read(k []byte) ([]byte, error) {
 	// offset is the position where the key starts
 	// need to skip int64(keylen) + actual key value + int64(vallen)
 	valOffset := entry.offset + 8 + int64(len(k)) + 8
-	return s.log.read(entry.fileId, valOffset, entry.valSz)
+	f := s.lru.get(entry.fileId)
+	if f == nil {
+		f, err = os.Open(entry.fileId)
+		if err != nil {
+			return nil, err
+		}
+		s.lru.add(entry.fileId, f)
+	}
+	return s.log.read(f, valOffset, entry.valSz)
 }
 
+func (s *Store) Stop() {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	s.cancelChan <- struct{}{}
+	if err := s.keyDir.save(); err != nil {
+		log.Fatal(err)
+	}
+	s.log.close()
+}
 func (s *Store) merge() {
+	segments, err := os.ReadDir("db")
+	if err != nil {
+		return
+	}
+
+	totalSegments := 0
+	for _, segment := range segments {
+		if !strings.HasPrefix(segment.Name(), "kd") {
+			totalSegments++
+		}
+	}
+	mergeFactor := 0.5
+	filesToMerge := int(float64(totalSegments-1) * mergeFactor) // dont merge the active file
+
+	if filesToMerge < 2 {
+		return
+	}
 
 	mergedSegment, err := s.log.createNewSegment()
 	if err != nil {
@@ -76,23 +123,16 @@ func (s *Store) merge() {
 	// merge 50% files of the files
 
 	// filename, err := s.log.createNewSegment()
-	segments, err := os.ReadDir("db")
-	if err != nil {
-		return
-	}
 
-	mergeFactor := 0.5
-	filesToMerge := int(float64(len(segments)-2) * mergeFactor) // dont merge the active file
-
-	if filesToMerge < 2 {
-		return
-	}
 	// you can still write but you cant read
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
 	for i := range filesToMerge {
 		segment := segments[i]
+		if strings.HasPrefix(segment.Name(), "kd") {
+			continue
+		}
 		fname := fmt.Sprintf("./db/%s", segment.Name())
 		f, err := os.Open(fname)
 		if err != nil {
