@@ -110,7 +110,7 @@ func (s *Store) Read(k []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		s.lru.add(entry.fileId, segment)
+		go s.lru.add(entry.fileId, segment)
 	}
 	return segment.read(valOffset, int32(entry.valSz))
 }
@@ -121,6 +121,10 @@ func (s *Store) Stop() {
 	s.mtx.Lock()
 	s.log.activeSegment.close()
 	s.mtx.Unlock()
+}
+
+func (s *Store) Sync() error {
+	return s.log.activeSegment.sync()
 }
 func (s *Store) merge(mergeAll bool) {
 	segments, err := os.ReadDir("db")
@@ -170,7 +174,6 @@ func (s *Store) merge(mergeAll bool) {
 				log.Println(err)
 				return
 			}
-			fmt.Printf("record: %s %s\n", string(record.key), string(record.val))
 			entry, err := s.keyDir.get(record.key)
 			if err != nil {
 				continue
@@ -195,6 +198,7 @@ func (s *Store) merge(mergeAll bool) {
 			log.Println(err)
 		}
 	}
+	s.lru.reset()
 }
 
 func ensureDir(dirName string) error {

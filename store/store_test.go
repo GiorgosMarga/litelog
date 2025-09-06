@@ -126,14 +126,6 @@ func TestMerge(t *testing.T) {
 	}
 
 	wg.Wait()
-	// time.Sleep(500 * time.Millisecond)
-	// for range n {
-	// 	i := rand.Intn(n)
-	// 	key := fmt.Appendf(nil, "key_%d", i)
-	// 	val := fmt.Appendf(nil, "val_%d", i)
-
-	// }
-	// clearDB()
 }
 
 func TestStoreSaveLoad(t *testing.T) {
@@ -226,4 +218,17 @@ func TestDeleteWithStop(t *testing.T) {
 		}
 	}
 
+}
+
+func TestLru(t *testing.T) {
+	lru := NewLRU(20)
+	for range 1_000_000 {
+		c := rand.Intn(10)
+		n := rand.Intn(2)
+		if n == 0 {
+			lru.add(int64(c), &Segment{})
+		} else {
+			lru.get(int64(c))
+		}
+	}
 }

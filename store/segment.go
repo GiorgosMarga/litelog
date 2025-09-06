@@ -167,7 +167,9 @@ func (s *Segment) writeRecord(rec *Record) (int64, error) {
 	}
 	return offset, nil
 }
-
+func (s *Segment) sync() error {
+	return s.f.Sync()
+}
 func (s *Segment) remove() error {
 	s.close()
 	// remove its hint file if exists
@@ -178,4 +180,5 @@ func (s *Segment) remove() error {
 	}
 
 	return os.Remove(s.f.Name())
+
 }
