@@ -1,12 +1,8 @@
 package store
 
-import (
-	"os"
-)
-
 type node struct {
-	key  string
-	val  *os.File
+	key  int64
+	val  *Segment
 	next *node
 }
 
@@ -23,7 +19,7 @@ func NewLRU(maxSz int) *lru {
 	}
 }
 
-func (l *lru) add(k string, f *os.File) {
+func (l *lru) add(k int64, f *Segment) {
 	n := node{
 		val: f,
 		key: k,
@@ -35,7 +31,7 @@ func (l *lru) add(k string, f *os.File) {
 		return
 	}
 	if l.currentSz == l.maxSz {
-		l.head.val.Close()
+		l.head.val.close()
 		l.head = l.head.next
 		l.currentSz--
 	} else {
@@ -45,7 +41,7 @@ func (l *lru) add(k string, f *os.File) {
 	l.currentSz++
 }
 
-func (l *lru) get(k string) (f *os.File) {
+func (l *lru) get(k int64) (f *Segment) {
 	curr := l.head
 	for curr != nil {
 		if curr.key == k {

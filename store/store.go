@@ -1,14 +1,17 @@
 package store
 
 import (
-	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
-	"strings"
 	"sync"
 	"time"
+)
+
+var (
+	ErrNotFound error = errors.New("key not found")
 )
 
 type Store struct {
@@ -20,6 +23,14 @@ type Store struct {
 }
 
 func NewStore() *Store {
+
+	if err := ensureDir("db"); err != nil {
+		panic(err)
+	}
+
+	if err := ensureDir("hint"); err != nil {
+		panic(err)
+	}
 
 	kd := NewKeyDir()
 	if err := kd.load(); err != nil {
@@ -39,9 +50,8 @@ func NewStore() *Store {
 		for {
 			select {
 			case <-timer.C:
-				store.merge()
+				store.merge(false)
 			case <-s.cancelChan:
-				fmt.Println("Stop merging")
 				return
 			default:
 				time.Sleep(10 * time.Millisecond)
@@ -55,13 +65,16 @@ func (s *Store) Write(k, v []byte) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	fileid := s.log.activeSegment.Name()
 	offset, err := s.log.write(k, v)
 	if err != nil {
 		return err
 	}
-	s.keyDir.add(k, fileid, offset, int64(len(v)))
+	s.keyDir.add(k, s.log.activeSegment.id, offset, int64(len(v)))
 	return nil
+}
+
+func (s *Store) Delete(k []byte) error {
+	return s.Write(k, []byte{})
 }
 
 func (s *Store) Read(k []byte) ([]byte, error) {
@@ -69,142 +82,129 @@ func (s *Store) Read(k []byte) ([]byte, error) {
 	defer s.mtx.RUnlock()
 	entry, err := s.keyDir.get(k)
 	if err != nil {
-		return nil, fmt.Errorf("key doesnt exist")
+		return nil, ErrNotFound
+	}
+
+	// value is deleted
+	if entry.valSz == 0 {
+		return nil, ErrNotFound
 	}
 	// offset is the position where the key starts
-	// need to skip int64(keylen) + actual key value + int64(vallen)
-	valOffset := entry.offset + 8 + int64(len(k)) + 8
-	f := s.lru.get(entry.fileId)
-	if f == nil {
-		f, err = os.Open(entry.fileId)
+	// need to skip headers
+	valOffset := entry.offset + HEADERS_SIZE + int64(len(k))
+	if entry.fileId == s.log.activeSegment.id {
+		return s.log.read(valOffset, entry.valSz)
+	}
+
+	segment := s.lru.get(entry.fileId)
+	if segment == nil {
+		f, err := os.Open(fmt.Sprintf("./db/%d", entry.fileId))
 		if err != nil {
 			return nil, err
 		}
-		s.lru.add(entry.fileId, f)
+		segment, err = segmentFromFile(f)
+		if err != nil {
+			return nil, err
+		}
+		s.lru.add(entry.fileId, segment)
 	}
-	return s.log.read(f, valOffset, entry.valSz)
+	return segment.read(valOffset, entry.valSz)
 }
 
 func (s *Store) Stop() {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
 	s.cancelChan <- struct{}{}
-	if err := s.keyDir.save(); err != nil {
-		log.Fatal(err)
-	}
-	s.log.close()
+	s.merge(true)
+	s.mtx.Lock()
+	s.log.activeSegment.close()
+	s.mtx.Unlock()
 }
-func (s *Store) merge() {
+func (s *Store) merge(mergeAll bool) {
 	segments, err := os.ReadDir("db")
 	if err != nil {
 		return
 	}
-
-	totalSegments := 0
-	for _, segment := range segments {
-		if !strings.HasPrefix(segment.Name(), "kd") {
-			totalSegments++
-		}
+	totalSegments := len(segments)
+	// if merge all, merge was called from close
+	if !mergeAll {
+		// if merge is called from a routine, dont merge the active file
+		totalSegments--
 	}
-	mergeFactor := 0.5
-	filesToMerge := int(float64(totalSegments-1) * mergeFactor) // dont merge the active file
 
-	if filesToMerge < 2 {
+	if !mergeAll && totalSegments < 2 {
 		return
 	}
-
-	mergedSegment, err := s.log.createNewSegment()
+	mergedSegment, err := createNewSegment()
 	if err != nil {
 		log.Println(err)
 		return
 	}
-	defer mergedSegment.Close()
+	defer mergedSegment.close()
+	hintF, err := os.OpenFile(fmt.Sprintf("./hint/%d", mergedSegment.id), os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		log.Println(err)
+		return
+	}
 
-	// merge 50% files of the files
-
-	// filename, err := s.log.createNewSegment()
-
-	// you can still write but you cant read
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	for i := range filesToMerge {
-		segment := segments[i]
-		if strings.HasPrefix(segment.Name(), "kd") {
-			continue
-		}
-		fname := fmt.Sprintf("./db/%s", segment.Name())
-		f, err := os.Open(fname)
+	for i := range totalSegments {
+		dirEntry := segments[i]
+		segment, err := segmentFromFileName(dirEntry.Name())
 		if err != nil {
+			log.Println(err)
 			continue
 		}
-		defer f.Close()
 		for {
-			k, v, err := s.readRecord(f)
+
+			record, err := segment.readRecord()
 			if err != nil {
-				break
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				log.Println(err)
+				return
 			}
-			entry, err := s.keyDir.get(k)
+			entry, err := s.keyDir.get(record.key)
 			if err != nil {
 				continue
 			}
-			if entry.fileId != f.Name() {
+			if entry.fileId != segment.id {
 				continue // this is an old one
 			}
+			if entry.valSz == 0 {
+				continue // this is a deleted key
+			}
 
-			offset, err := s.writeRecord(mergedSegment, k, v)
+			offset, err := mergedSegment.writeRecord(record)
 			if err != nil {
+				log.Println(err)
 				continue
 			}
-			s.keyDir.add(k, mergedSegment.Name(), offset, int64(len(v)))
+			newEntry := s.keyDir.add(record.key, mergedSegment.id, offset, int64(len(record.val)))
+			newEntry.save(hintF, record.key)
 		}
-		if err := os.Remove(fname); err != nil {
+		if err := segment.remove(); err != nil {
 			log.Println(err)
 		}
 	}
 }
 
-func (s *Store) readRecord(f *os.File) ([]byte, []byte, error) {
-	var (
-		keySz int64
-		valSz int64
-	)
-	if err := binary.Read(f, binary.LittleEndian, &keySz); err != nil {
-		return nil, nil, err
+func ensureDir(dirName string) error {
+	err := os.Mkdir(dirName, 0755)
+	if err == nil {
+		return nil
 	}
-	key := make([]byte, keySz)
-	if err := binary.Read(f, binary.LittleEndian, &key); err != nil {
-		return nil, nil, err
+	if os.IsExist(err) {
+		// check that the existing path is a directory
+		info, err := os.Stat(dirName)
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			return errors.New("path exists but is not a directory")
+		}
+		return nil
 	}
-
-	if err := binary.Read(f, binary.LittleEndian, &valSz); err != nil {
-		return nil, nil, err
-	}
-	val := make([]byte, valSz)
-	if err := binary.Read(f, binary.LittleEndian, &val); err != nil {
-		return nil, nil, err
-	}
-
-	return key, val, nil
-}
-func (s *Store) writeRecord(f *os.File, k, v []byte) (int64, error) {
-	offset, err := f.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return -1, err
-	}
-	if err := binary.Write(f, binary.LittleEndian, int64(len(k))); err != nil {
-		return -1, err
-	}
-	if err := binary.Write(f, binary.LittleEndian, k); err != nil {
-		return -1, err
-	}
-
-	if err := binary.Write(f, binary.LittleEndian, int64(len(v))); err != nil {
-		return -1, err
-	}
-	if err := binary.Write(f, binary.LittleEndian, v); err != nil {
-		return -1, err
-	}
-
-	return offset, nil
+	return err
 }

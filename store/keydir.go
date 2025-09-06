@@ -5,8 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
-	"strings"
+	"strconv"
 	"time"
 )
 
@@ -16,7 +17,7 @@ type KeyDir struct {
 
 type KeyDirEntry struct {
 	tstamp int64
-	fileId string
+	fileId int64
 	offset int64
 	valSz  int64
 }
@@ -27,7 +28,7 @@ func NewKeyDir() *KeyDir {
 	}
 }
 
-func (kd *KeyDir) add(k []byte, fileId string, offset, valSz int64) {
+func (kd *KeyDir) add(k []byte, fileId int64, offset, valSz int64) *KeyDirEntry {
 	entry := KeyDirEntry{
 		tstamp: time.Now().Unix(),
 		fileId: fileId,
@@ -35,6 +36,7 @@ func (kd *KeyDir) add(k []byte, fileId string, offset, valSz int64) {
 		valSz:  valSz,
 	}
 	kd.memHashMap[string(k)] = &entry
+	return &entry
 }
 
 func (kd *KeyDir) get(k []byte) (*KeyDirEntry, error) {
@@ -45,73 +47,55 @@ func (kd *KeyDir) get(k []byte) (*KeyDirEntry, error) {
 	return entry, nil
 }
 
-func (kd *KeyDir) save() error {
-	filename := fmt.Sprintf("./db/kd_%d", time.Now().UnixMicro())
-	f, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	for key, entry := range kd.memHashMap {
-		binary.Write(f, binary.LittleEndian, int64(len(key)))
-		binary.Write(f, binary.LittleEndian, []byte(key))
-		binary.Write(f, binary.LittleEndian, entry.tstamp)
-		binary.Write(f, binary.LittleEndian, entry.offset)
-		binary.Write(f, binary.LittleEndian, entry.valSz)
-		binary.Write(f, binary.LittleEndian, int64(len(entry.fileId)))
-		binary.Write(f, binary.LittleEndian, []byte(entry.fileId))
-	}
+func (entry *KeyDirEntry) save(f *os.File, k []byte) error {
+	binary.Write(f, binary.LittleEndian, entry.tstamp)
+	binary.Write(f, binary.LittleEndian, int64(len(k)))
+	binary.Write(f, binary.LittleEndian, []byte(k))
+	binary.Write(f, binary.LittleEndian, entry.valSz)
+	binary.Write(f, binary.LittleEndian, entry.offset)
 	return nil
 }
 
 func (kd *KeyDir) load() error {
-	segments, err := os.ReadDir("./db")
+	segments, err := os.ReadDir("./hint")
 	if err != nil {
 		return err
 	}
-
-	var latestKDFile string
-	for i := len(segments) - 1; i >= 0; i-- {
-		if strings.HasPrefix(segments[i].Name(), "kd") {
-			latestKDFile = segments[i].Name()
-			break
-		}
-	}
-
 	// first start no kd file available
-	if latestKDFile == "" {
+	if len(segments) == 0 {
 		return nil
 	}
+	latestKDFile := segments[len(segments)-1]
 
-	f, err := os.Open(fmt.Sprintf("./db/%s", latestKDFile))
+	fId, err := strconv.ParseInt(latestKDFile.Name(), 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid hint file")
+	}
+
+	f, err := os.Open(fmt.Sprintf("./hint/%s", latestKDFile.Name()))
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	var (
-		keyLen int64
-		fIdLen int64
-	)
+	log.Printf("Load from: %s\n", f.Name())
 
+	defer f.Close()
+	var keyLen int64
 	for {
-		if err := binary.Read(f, binary.LittleEndian, &keyLen); err != nil {
+		entry := KeyDirEntry{
+			fileId: fId,
+		}
+		if err := binary.Read(f, binary.LittleEndian, &entry.tstamp); err != nil {
 			if errors.Is(err, io.EOF) {
 				break
 			}
 			return err
 		}
-		entry := KeyDirEntry{}
+		binary.Read(f, binary.LittleEndian, &keyLen)
 		key := make([]byte, keyLen)
-
 		binary.Read(f, binary.LittleEndian, key)
-		binary.Read(f, binary.LittleEndian, &entry.tstamp)
-		binary.Read(f, binary.LittleEndian, &entry.offset)
 		binary.Read(f, binary.LittleEndian, &entry.valSz)
-		binary.Read(f, binary.LittleEndian, &fIdLen)
-		fId := make([]byte, fIdLen)
-		binary.Read(f, binary.LittleEndian, fId)
-		entry.fileId = string(fId)
+
+		binary.Read(f, binary.LittleEndian, &entry.offset)
 		kd.memHashMap[string(key)] = &entry
 	}
 	return nil

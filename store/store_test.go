@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -12,27 +13,28 @@ import (
 )
 
 func clearDB() {
-	entries, err := os.ReadDir("db")
-	if err != nil {
-		return
-	}
-	for _, entry := range entries {
-		os.Remove(fmt.Sprintf("./db/%s", entry.Name()))
-	}
+	os.RemoveAll("./db")
+	os.RemoveAll("./hint")
 
 }
 func TestSimpleLog(t *testing.T) {
+	clearDB()
 	log := NewLog()
 
 	key := []byte("Hello")
 	val := []byte("World")
 	log.write(key, val)
 
-	v, err := log.read(log.activeSegment, 0, int64(len(val)))
+	pos := HEADERS_SIZE + int64(len(key))
+	v, err := log.read(pos, int64(len(val)))
 	if err != nil {
 		t.FailNow()
 	}
 
+	if !bytes.Equal(val, v) {
+		fmt.Printf("Different val. Expected %s got %s\n", string(val), string(v))
+		fmt.Println()
+	}
 	fmt.Println(string(v))
 	clearDB()
 }
@@ -50,6 +52,7 @@ func TestMultipleWritesLog(t *testing.T) {
 		}
 	}
 
+	time.Sleep(1 * time.Second)
 	for range n {
 		i := rand.Intn(n)
 		expectedVal := fmt.Appendf(nil, "val_%d", i)
@@ -63,7 +66,7 @@ func TestMultipleWritesLog(t *testing.T) {
 			t.FailNow()
 		}
 	}
-	clearDB()
+	// clearDB()
 }
 
 func TestMultipleWritesParallel(t *testing.T) {
@@ -145,20 +148,84 @@ func TestStoreSaveLoad(t *testing.T) {
 		val := fmt.Appendf(nil, "val_%d", i)
 		s.Write(key, val)
 	}
-
 	s.Stop()
-	fmt.Println("Stopped")
 	s = NewStore()
 	for i := range n {
 		key := fmt.Appendf(nil, "key_%d", i)
 		val := fmt.Appendf(nil, "val_%d", i)
 		v, err := s.Read(key)
 		if err != nil {
-			fmt.Println(err)
+			fmt.Printf("[%s]: %s\n", string(key), err.Error())
 			t.FailNow()
 		}
 		if !bytes.Equal(v, val) {
 			fmt.Printf("Expected %s, got %s\n", string(val), string(v))
+		}
+	}
+
+}
+
+func TestDelete(t *testing.T) {
+	clearDB()
+	s := NewStore()
+	n := 100_000
+	for i := range n {
+		key := fmt.Appendf(nil, "key_%d", i)
+		val := fmt.Appendf(nil, "val_%d", i)
+		if err := s.Write(key, val); err != nil {
+			fmt.Println(err)
+			t.FailNow()
+		}
+		if err := s.Delete(key); err != nil {
+			fmt.Println(err)
+			t.FailNow()
+		}
+	}
+	fmt.Println("Deleted all")
+	for i := range n {
+		key := fmt.Appendf(nil, "key_%d", i)
+		v, err := s.Read(key)
+		if err == nil {
+			fmt.Printf("Key: %s val: %s\n", string(key), string(v))
+			t.FailNow()
+		}
+		if !errors.Is(err, ErrNotFound) {
+			fmt.Println(err)
+			t.FailNow()
+		}
+	}
+
+}
+
+func TestDeleteWithStop(t *testing.T) {
+	clearDB()
+	s := NewStore()
+	n := 100_000
+	for i := range n {
+		key := fmt.Appendf(nil, "key_%d", i)
+		val := fmt.Appendf(nil, "val_%d", i)
+		if err := s.Write(key, val); err != nil {
+			fmt.Println(err)
+			t.FailNow()
+		}
+		if err := s.Delete(key); err != nil {
+			fmt.Println(err)
+			t.FailNow()
+		}
+	}
+	fmt.Println("Deleted all")
+	s.Stop()
+	s = NewStore()
+	for i := range n {
+		key := fmt.Appendf(nil, "key_%d", i)
+		v, err := s.Read(key)
+		if err == nil {
+			fmt.Printf("Key: %s val: %s\n", string(key), string(v))
+			t.FailNow()
+		}
+		if !errors.Is(err, ErrNotFound) {
+			fmt.Println(err)
+			t.FailNow()
 		}
 	}
 
