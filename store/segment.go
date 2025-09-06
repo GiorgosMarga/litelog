@@ -1,9 +1,9 @@
 package store
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"strconv"
@@ -74,83 +74,73 @@ func (s *Segment) write(k, v []byte) (int64, error) {
 		return -1, err
 	}
 
-	// write CRC
-	//TODO: crc
-	if err := binary.Write(s.f, binary.LittleEndian, int64(10)); err != nil {
-		return -1, err
-	}
-	// write ts_stamp
-	if err := binary.Write(s.f, binary.LittleEndian, time.Now().UnixMicro()); err != nil {
-		return -1, err
-	}
-	// write k_sz
-	if err := binary.Write(s.f, binary.LittleEndian, int64(len(k))); err != nil {
-		return -1, err
-	}
-	// write k
-	if err := binary.Write(s.f, binary.LittleEndian, k); err != nil {
-		return -1, err
-	}
+	tstamp := time.Now().UnixMicro()
+	data := make([]byte, HEADERS_SIZE+len(k)+len(v))
+	binary.LittleEndian.PutUint64(data[4:12], uint64(tstamp))
+	binary.LittleEndian.PutUint32(data[12:16], uint32(len(k)))
+	binary.LittleEndian.PutUint32(data[16:20], uint32(len(v)))
+	copy(data[20:], k)
+	copy(data[20+len(k):], v)
 
-	// write v_sz
-	if err := binary.Write(s.f, binary.LittleEndian, int64(len(v))); err != nil {
+	// write CRC
+	crc := crc32.ChecksumIEEE(data)
+	binary.LittleEndian.PutUint32(data[0:4], uint32(crc))
+	n, err := s.f.Write(data)
+	if err != nil {
 		return -1, err
 	}
-	// write v
-	if err := binary.Write(s.f, binary.LittleEndian, v); err != nil {
-		return -1, err
+	if n != len(data) {
+		return -1, ErrCorrupted
 	}
 	return offset, nil
 }
 
-func (s *Segment) read(offset, size int64) ([]byte, error) {
+func (s *Segment) read(offset int64, size int32) ([]byte, error) {
 	b := make([]byte, size)
-	_, err := s.f.ReadAt(b, offset)
+	n, err := s.f.ReadAt(b, offset)
 	if err != nil {
 		return nil, err
 	}
-	v := make([]byte, size)
-	if err := binary.Read(bytes.NewReader(b), binary.LittleEndian, v); err != nil {
-		return nil, err
+	if int32(n) != size {
+		return nil, ErrCorrupted
 	}
-	return v, nil
+	return b, nil
 }
 
 func (s *Segment) readRecord() (*Record, error) {
 	var (
-		crc   int64
-		keySz int64
-		valSz int64
+		keySz int32
+		valSz int32
 	)
 	rec := Record{}
-	if err := binary.Read(s.f, binary.LittleEndian, &crc); err != nil {
+	header := make([]byte, HEADERS_SIZE)
+	n, err := s.f.Read(header)
+	if err != nil {
 		return nil, err
 	}
-	// if crc != 10 {
-	// 	fmt.Println("here")
-	// 	return nil, fmt.Errorf("wrong crc")
-	// }
-
-	if err := binary.Read(s.f, binary.LittleEndian, &rec.tstamp); err != nil {
+	if n != len(header) {
+		return nil, ErrCorrupted
+	}
+	rec.crc = int32(binary.LittleEndian.Uint32(header[0:4]))
+	rec.tstamp = int64(binary.LittleEndian.Uint64(header[4:12]))
+	keySz = int32(binary.LittleEndian.Uint32(header[12:16]))
+	if keySz > MAX_KEY_SIZE {
+		return nil, ErrInvalidKeySize
+	}
+	valSz = int32(binary.LittleEndian.Uint32(header[16:20]))
+	if valSz > MAX_VALUE_SIZE {
+		return nil, ErrInvalidValueSize
+	}
+	kv := make([]byte, keySz+valSz)
+	n, err = s.f.Read(kv)
+	if err != nil {
 		return nil, err
 	}
-
-	if err := binary.Read(s.f, binary.LittleEndian, &keySz); err != nil {
-		return nil, err
+	if n != int(keySz)+int(valSz) {
+		return nil, ErrCorrupted
 	}
-	key := make([]byte, keySz)
-	if err := binary.Read(s.f, binary.LittleEndian, &key); err != nil {
-		return nil, err
-	}
-	rec.key = key
-	if err := binary.Read(s.f, binary.LittleEndian, &valSz); err != nil {
-		return nil, err
-	}
-	val := make([]byte, valSz)
-	if err := binary.Read(s.f, binary.LittleEndian, &val); err != nil {
-		return nil, err
-	}
-	rec.val = val
+	rec.key = kv[:keySz]
+	rec.val = kv[keySz:]
 
 	return &rec, nil
 }
@@ -160,29 +150,21 @@ func (s *Segment) writeRecord(rec *Record) (int64, error) {
 	if err != nil {
 		return -1, err
 	}
-	// TODO: crc
-	if err := binary.Write(s.f, binary.LittleEndian, int64(10)); err != nil {
-		return -1, err
-	}
+	header := make([]byte, HEADERS_SIZE+len(rec.key)+len(rec.val))
+	binary.LittleEndian.PutUint32(header[0:4], uint32(rec.crc))
+	binary.LittleEndian.PutUint64(header[4:12], uint64(rec.tstamp))
+	binary.LittleEndian.PutUint32(header[12:16], uint32(len(rec.key)))
+	binary.LittleEndian.PutUint32(header[16:20], uint32(len(rec.val)))
+	copy(header[20:], rec.key)
+	copy(header[20+len(rec.key):], rec.val)
 
-	if err := binary.Write(s.f, binary.LittleEndian, rec.tstamp); err != nil {
+	n, err := s.f.Write(header)
+	if err != nil {
 		return -1, err
 	}
-
-	if err := binary.Write(s.f, binary.LittleEndian, int64(len(rec.key))); err != nil {
-		return -1, err
+	if n != len(header) {
+		return -1, ErrCorrupted
 	}
-	if err := binary.Write(s.f, binary.LittleEndian, rec.key); err != nil {
-		return -1, err
-	}
-
-	if err := binary.Write(s.f, binary.LittleEndian, int64(len(rec.val))); err != nil {
-		return -1, err
-	}
-	if err := binary.Write(s.f, binary.LittleEndian, rec.val); err != nil {
-		return -1, err
-	}
-
 	return offset, nil
 }
 

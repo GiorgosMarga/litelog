@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -19,7 +20,7 @@ type KeyDirEntry struct {
 	tstamp int64
 	fileId int64
 	offset int64
-	valSz  int64
+	valSz  uint32
 }
 
 func NewKeyDir() *KeyDir {
@@ -28,7 +29,7 @@ func NewKeyDir() *KeyDir {
 	}
 }
 
-func (kd *KeyDir) add(k []byte, fileId int64, offset, valSz int64) *KeyDirEntry {
+func (kd *KeyDir) add(k []byte, fileId, offset int64, valSz uint32) *KeyDirEntry {
 	entry := KeyDirEntry{
 		tstamp: time.Now().Unix(),
 		fileId: fileId,
@@ -47,13 +48,16 @@ func (kd *KeyDir) get(k []byte) (*KeyDirEntry, error) {
 	return entry, nil
 }
 
-func (entry *KeyDirEntry) save(f *os.File, k []byte) error {
-	binary.Write(f, binary.LittleEndian, entry.tstamp)
-	binary.Write(f, binary.LittleEndian, int64(len(k)))
-	binary.Write(f, binary.LittleEndian, []byte(k))
-	binary.Write(f, binary.LittleEndian, entry.valSz)
-	binary.Write(f, binary.LittleEndian, entry.offset)
-	return nil
+func (entry *KeyDirEntry) save(f *bufio.Writer, k []byte) error {
+	// tstamp_size + key_size + len(k) + value_size + offset_size
+	buf := make([]byte, TSTAMP_SIZE+KEY_SIZE+len(k)+VALUE_SIZE+OFFSET_SIZE)
+	binary.LittleEndian.PutUint64(buf[0:8], uint64(entry.tstamp))
+	binary.LittleEndian.PutUint32(buf[8:12], uint32(len(k)))
+	binary.LittleEndian.PutUint32(buf[12:16], entry.valSz)
+	binary.LittleEndian.PutUint64(buf[16:24], uint64(entry.offset))
+	copy(buf[24:], k)
+	_, err := f.Write(buf)
+	return err
 }
 
 func (kd *KeyDir) load() error {
@@ -79,23 +83,44 @@ func (kd *KeyDir) load() error {
 	log.Printf("Load from: %s\n", f.Name())
 
 	defer f.Close()
-	var keyLen int64
+
+	// maxEntrySize := TSTAMP_SIZE + KEY_SIZE + math.MaxUint32 +
+	header := make([]byte, TSTAMP_SIZE+KEY_SIZE+VALUE_SIZE+OFFSET_SIZE)
 	for {
 		entry := KeyDirEntry{
 			fileId: fId,
 		}
-		if err := binary.Read(f, binary.LittleEndian, &entry.tstamp); err != nil {
+
+		n, err := f.Read(header)
+		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break
 			}
 			return err
 		}
-		binary.Read(f, binary.LittleEndian, &keyLen)
-		key := make([]byte, keyLen)
-		binary.Read(f, binary.LittleEndian, key)
-		binary.Read(f, binary.LittleEndian, &entry.valSz)
+		if n != len(header) {
+			return fmt.Errorf("truncated header")
+		}
 
-		binary.Read(f, binary.LittleEndian, &entry.offset)
+		entry.tstamp = int64(binary.LittleEndian.Uint64(header[0:8]))
+		keySz := binary.LittleEndian.Uint32(header[8:12])
+		if keySz >= MAX_KEY_SIZE {
+			return ErrInvalidKeySize
+		}
+		entry.valSz = binary.LittleEndian.Uint32(header[12:16])
+		if entry.valSz >= MAX_VALUE_SIZE {
+			return ErrInvalidValueSize
+		}
+		entry.offset = int64(binary.LittleEndian.Uint64(header[16:24]))
+		key := make([]byte, keySz)
+		n, err = f.Read(key)
+		if err != nil {
+			return err
+		}
+		if n != int(keySz) {
+			return ErrCorrupted
+		}
+
 		kd.memHashMap[string(key)] = &entry
 	}
 	return nil

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -11,7 +12,10 @@ import (
 )
 
 var (
-	ErrNotFound error = errors.New("key not found")
+	ErrNotFound         error = errors.New("key not found")
+	ErrInvalidKeySize   error = errors.New("invalid key size")
+	ErrInvalidValueSize error = errors.New("invalid val size")
+	ErrCorrupted        error = errors.New("corrupted file")
 )
 
 type Store struct {
@@ -69,7 +73,7 @@ func (s *Store) Write(k, v []byte) error {
 	if err != nil {
 		return err
 	}
-	s.keyDir.add(k, s.log.activeSegment.id, offset, int64(len(v)))
+	s.keyDir.add(k, s.log.activeSegment.id, offset, uint32(len(v)))
 	return nil
 }
 
@@ -93,7 +97,7 @@ func (s *Store) Read(k []byte) ([]byte, error) {
 	// need to skip headers
 	valOffset := entry.offset + HEADERS_SIZE + int64(len(k))
 	if entry.fileId == s.log.activeSegment.id {
-		return s.log.read(valOffset, entry.valSz)
+		return s.log.read(valOffset, int32(entry.valSz))
 	}
 
 	segment := s.lru.get(entry.fileId)
@@ -108,7 +112,7 @@ func (s *Store) Read(k []byte) ([]byte, error) {
 		}
 		s.lru.add(entry.fileId, segment)
 	}
-	return segment.read(valOffset, entry.valSz)
+	return segment.read(valOffset, int32(entry.valSz))
 }
 
 func (s *Store) Stop() {
@@ -145,6 +149,7 @@ func (s *Store) merge(mergeAll bool) {
 		return
 	}
 
+	hbf := bufio.NewWriter(hintF)
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
@@ -165,6 +170,7 @@ func (s *Store) merge(mergeAll bool) {
 				log.Println(err)
 				return
 			}
+			fmt.Printf("record: %s %s\n", string(record.key), string(record.val))
 			entry, err := s.keyDir.get(record.key)
 			if err != nil {
 				continue
@@ -181,9 +187,10 @@ func (s *Store) merge(mergeAll bool) {
 				log.Println(err)
 				continue
 			}
-			newEntry := s.keyDir.add(record.key, mergedSegment.id, offset, int64(len(record.val)))
-			newEntry.save(hintF, record.key)
+			newEntry := s.keyDir.add(record.key, mergedSegment.id, offset, uint32(len(record.val)))
+			newEntry.save(hbf, record.key)
 		}
+		hbf.Flush()
 		if err := segment.remove(); err != nil {
 			log.Println(err)
 		}

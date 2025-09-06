@@ -17,26 +17,23 @@ func clearDB() {
 	os.RemoveAll("./hint")
 
 }
-func TestSimpleLog(t *testing.T) {
+func TestSimpleStore(t *testing.T) {
 	clearDB()
-	log := NewLog()
+	s := NewStore()
 
 	key := []byte("Hello")
 	val := []byte("World")
-	log.write(key, val)
+	s.Write(key, val)
 
-	pos := HEADERS_SIZE + int64(len(key))
-	v, err := log.read(pos, int64(len(val)))
+	v, err := s.Read(key)
 	if err != nil {
+		fmt.Println(err)
 		t.FailNow()
 	}
-
-	if !bytes.Equal(val, v) {
-		fmt.Printf("Different val. Expected %s got %s\n", string(val), string(v))
-		fmt.Println()
+	if !bytes.Equal(v, val) {
+		fmt.Printf("Expected %s got %s\n", string(val), string(v))
 	}
-	fmt.Println(string(v))
-	clearDB()
+	// clearDB()
 }
 
 func TestMultipleWritesLog(t *testing.T) {

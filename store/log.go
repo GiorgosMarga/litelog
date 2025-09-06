@@ -2,11 +2,14 @@ package store
 
 // headers: crc + tstamp + ksz + vsz + ( k + v )
 const (
-	CRC_SIZE     = 8
-	TSTAMP_SIZE  = 8
-	KEY_SIZE     = 8
-	VALUES_SIZE  = 8
-	HEADERS_SIZE = CRC_SIZE + TSTAMP_SIZE + KEY_SIZE + VALUES_SIZE
+	CRC_SIZE       = 4
+	TSTAMP_SIZE    = 8
+	KEY_SIZE       = 4
+	VALUE_SIZE     = 4
+	OFFSET_SIZE    = 8
+	MAX_KEY_SIZE   = 64 * 1024        // 64 KB
+	MAX_VALUE_SIZE = 16 * 1024 * 1024 // 16 MB
+	HEADERS_SIZE   = CRC_SIZE + TSTAMP_SIZE + KEY_SIZE + VALUE_SIZE
 )
 
 type Log struct {
@@ -25,7 +28,13 @@ func NewLog() *Log {
 }
 
 func (l *Log) write(k []byte, v []byte) (int64, error) {
-	// total bytes: tstamp_length + key_size + value_size + k + v
+	if len(k) > MAX_KEY_SIZE {
+		return -1, ErrInvalidKeySize
+	}
+	if len(v) > MAX_VALUE_SIZE {
+		return -1, ErrInvalidValueSize
+	}
+	// total bytes: crc + tstamp_length + key_size + value_size + k + v
 	totalSize := HEADERS_SIZE + len(k) + len(v)
 	sz, err := l.activeSegment.getSize()
 	if err != nil {
@@ -41,6 +50,6 @@ func (l *Log) write(k []byte, v []byte) (int64, error) {
 	return l.activeSegment.write(k, v)
 }
 
-func (l *Log) read(pos, valSz int64) ([]byte, error) {
+func (l *Log) read(pos int64 , valSz int32) ([]byte, error) {
 	return l.activeSegment.read(pos, valSz)
 }
